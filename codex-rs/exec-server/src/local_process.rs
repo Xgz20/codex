@@ -59,6 +59,10 @@ use crate::rpc::RpcServerOutboundMessage;
 use crate::rpc::internal_error;
 use crate::rpc::invalid_params;
 use crate::rpc::invalid_request;
+#[cfg(unix)]
+use crate::sites_preview::SitesPreviewListener;
+#[cfg(unix)]
+use crate::sites_preview::SitesPreviewListenerError;
 use crate::telemetry::ExecServerTelemetry;
 use crate::telemetry::ProcessMetricGuard;
 
@@ -234,8 +238,30 @@ impl LocalProcess {
         params: ExecParams,
     ) -> Result<(ExecResponse, watch::Sender<u64>, ExecProcessEventLog), JSONRPCErrorError> {
         let process_id = params.process_id.clone();
-        let prepared =
-            prepare_exec_request(&params, child_env(&params), self.runtime_paths.as_ref())?;
+        let mut env = child_env(&params);
+        #[cfg(unix)]
+        let sites_preview = match SitesPreviewListener::prepare(params.sites_preview) {
+            Ok(sites_preview) => sites_preview,
+            Err(error) => return Err(sites_preview_error(error)),
+        };
+        #[cfg(unix)]
+        let inherited_fds = sites_preview
+            .as_ref()
+            .map(|sites_preview| vec![sites_preview.inherited_fd()])
+            .unwrap_or_default();
+        #[cfg(unix)]
+        if let Some(sites_preview) = sites_preview.as_ref() {
+            sites_preview.add_to_child_env(&mut env);
+        }
+        #[cfg(not(unix))]
+        if params.sites_preview {
+            return Err(invalid_params(
+                "Sites preview is only supported on Unix exec-server hosts".to_string(),
+            ));
+        }
+        #[cfg(not(unix))]
+        let inherited_fds = Vec::new();
+        let prepared = prepare_exec_request(&params, env, self.runtime_paths.as_ref())?;
         let (program, args) = prepared
             .command
             .split_first()
@@ -256,31 +282,34 @@ impl LocalProcess {
         }
 
         let spawned_result = if params.tty {
-            codex_utils_pty::spawn_pty_process(
+            codex_utils_pty::pty::spawn_process_with_inherited_fds(
                 program,
                 args,
                 prepared.cwd.as_path(),
                 &prepared.env,
                 &prepared.arg0,
                 TerminalSize::default(),
+                &inherited_fds,
             )
             .await
         } else if params.pipe_stdin {
-            codex_utils_pty::spawn_pipe_process(
+            codex_utils_pty::pipe::spawn_process_with_inherited_fds(
                 program,
                 args,
                 prepared.cwd.as_path(),
                 &prepared.env,
                 &prepared.arg0,
+                &inherited_fds,
             )
             .await
         } else {
-            codex_utils_pty::spawn_pipe_process_no_stdin(
+            codex_utils_pty::pipe::spawn_process_no_stdin_with_inherited_fds(
                 program,
                 args,
                 prepared.cwd.as_path(),
                 &prepared.env,
                 &prepared.arg0,
+                &inherited_fds,
             )
             .await
         };
@@ -297,6 +326,8 @@ impl LocalProcess {
                 return Err(internal_error(err.to_string()));
             }
         };
+        #[cfg(unix)]
+        drop(sites_preview);
 
         let output_notify = Arc::new(Notify::new());
         let (wake_tx, _wake_rx) = watch::channel(0);
@@ -582,6 +613,18 @@ fn child_env(params: &ExecParams) -> HashMap<String, String> {
     let mut env = shell_environment::create_env(&policy, /*thread_id*/ None);
     env.extend(params.env.clone());
     env
+}
+
+#[cfg(unix)]
+fn sites_preview_error(error: SitesPreviewListenerError) -> JSONRPCErrorError {
+    match error {
+        SitesPreviewListenerError::PortInUse => invalid_request(
+            "Sites preview port 4173 is already in use by another process".to_string(),
+        ),
+        SitesPreviewListenerError::Io(error) => {
+            internal_error(format!("failed to prepare Sites preview listener: {error}"))
+        }
+    }
 }
 
 fn shell_environment_policy(env_policy: &ExecEnvPolicy) -> ShellEnvironmentPolicy {
@@ -995,6 +1038,7 @@ mod tests {
             env,
             tty: false,
             pipe_stdin: false,
+            sites_preview: false,
             arg0: None,
             sandbox: None,
             enforce_managed_network: false,

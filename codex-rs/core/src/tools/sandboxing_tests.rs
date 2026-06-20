@@ -245,7 +245,13 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         capture_policy: crate::exec::ExecCapturePolicy::ShellTool,
     };
     let request = attempt
-        .env_for_exec_server(command(), options(), /*network*/ None, Some("remote"))
+        .env_for_exec_server(
+            command(),
+            options(),
+            /*network*/ None,
+            /*sites_preview*/ false,
+            Some("remote"),
+        )
         .expect("prepare remote exec request");
 
     assert_eq!(
@@ -275,9 +281,29 @@ fn exec_server_env_keeps_command_native_and_carries_sandbox_context() {
         Some(managed_network.clone())
     );
 
+    let sites_preview_request = attempt
+        .env_for_exec_server(
+            command(),
+            options(),
+            /*network*/ None,
+            /*sites_preview*/ true,
+            Some("remote"),
+        )
+        .expect("prepare Sites preview remote exec request");
+
+    assert!(sites_preview_request.sites_preview);
+    assert_eq!(sites_preview_request.sandbox, SandboxType::None);
+    assert!(sites_preview_request.exec_server_sandbox.is_some());
+
     attempt.sandbox_requested = false;
     let request = attempt
-        .env_for_exec_server(command(), options(), /*network*/ None, Some("remote"))
+        .env_for_exec_server(
+            command(),
+            options(),
+            /*network*/ None,
+            /*sites_preview*/ false,
+            Some("remote"),
+        )
         .expect("prepare unsandboxed remote exec request");
 
     assert_eq!(request.exec_server_sandbox, None);

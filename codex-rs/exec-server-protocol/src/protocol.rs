@@ -129,6 +129,9 @@ pub struct ExecParams {
     /// Keep non-tty stdin writable through `process/write`.
     #[serde(default)]
     pub pipe_stdin: bool,
+    /// Expose the fixed Sites preview server port from the Linux sandbox.
+    #[serde(default)]
+    pub sites_preview: bool,
     /// Optional process-visible argv0 override. Values such as `codex-linux-sandbox` are command
     /// names rather than paths, so this is not a [`PathUri`].
     pub arg0: Option<String>,
@@ -591,6 +594,7 @@ mod tests {
             pipe_stdin: false,
             arg0: None,
             sandbox: None,
+            sites_preview: false,
             enforce_managed_network: true,
             managed_network: Some(ManagedNetworkSandboxContext {
                 loopback_ports: vec![43123, 48081],

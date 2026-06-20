@@ -4,12 +4,17 @@
 use codex_core::exec_env::create_env;
 use codex_protocol::config_types::ShellEnvironmentPolicy;
 use codex_protocol::models::PermissionProfile;
+use codex_sandboxing::sites_preview::SITES_PREVIEW_LISTENER_FD_ENV_VAR;
+use codex_sandboxing::sites_preview::SITES_PREVIEW_PORT;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::io::Read;
 use std::io::Write;
 use std::net::Ipv4Addr;
+use std::net::Shutdown;
 use std::net::TcpListener;
+use std::net::TcpStream;
+use std::os::fd::AsRawFd;
 use std::process::Output;
 use std::process::Stdio;
 use std::time::Duration;
@@ -22,6 +27,8 @@ const MANAGED_PROXY_PERMISSION_ERR_SNIPPETS: &[&str] = &[
     "loopback: Failed RTM_NEWLINK",
     "setting up uid map: Permission denied",
     "No permissions to create a new namespace",
+    "Creating new namespace failed: Operation not permitted",
+    "SeccompInstall(Seccomp(Os { code: 22",
     "error isolating Linux network namespace for proxy mode",
 ];
 
@@ -112,6 +119,37 @@ async fn managed_proxy_skip_reason() -> Option<String> {
     None
 }
 
+async fn sites_preview_skip_reason() -> Option<String> {
+    if should_skip_bwrap_tests().await {
+        return Some("bubblewrap is unavailable in this environment".to_string());
+    }
+
+    let mut env = create_env_from_core_vars();
+    strip_proxy_env(&mut env);
+
+    let output = run_linux_sandbox_direct(
+        &["bash", "-c", "true"],
+        &PermissionProfile::read_only(),
+        /*allow_network_for_proxy*/ false,
+        env,
+        NETWORK_TIMEOUT_MS,
+    )
+    .await;
+    if output.status.success() {
+        return None;
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if is_managed_proxy_permission_error(stderr.as_ref()) {
+        return Some(format!(
+            "Sites preview requires kernel namespace privileges unavailable here: {}",
+            stderr.trim()
+        ));
+    }
+
+    None
+}
+
 async fn run_linux_sandbox_direct(
     command: &[&str],
     permission_profile: &PermissionProfile,
@@ -119,6 +157,26 @@ async fn run_linux_sandbox_direct(
     env: HashMap<String, String>,
     timeout_ms: u64,
 ) -> Output {
+    let mut cmd = linux_sandbox_command(
+        command,
+        permission_profile,
+        allow_network_for_proxy,
+        /*sites_preview*/ false,
+        env,
+    );
+    tokio::time::timeout(Duration::from_millis(timeout_ms), cmd.output())
+        .await
+        .expect("sandbox command should not time out")
+        .expect("sandbox command should execute")
+}
+
+fn linux_sandbox_command(
+    command: &[&str],
+    permission_profile: &PermissionProfile,
+    allow_network_for_proxy: bool,
+    sites_preview: bool,
+    env: HashMap<String, String>,
+) -> Command {
     let cwd = std::env::current_dir().expect("current directory should exist");
     let permission_profile_json =
         serde_json::to_string(permission_profile).expect("permission profile should serialize");
@@ -132,6 +190,9 @@ async fn run_linux_sandbox_direct(
     if allow_network_for_proxy {
         args.push("--allow-network-for-proxy".to_string());
     }
+    if sites_preview {
+        args.push("--sites-preview".to_string());
+    }
     args.push("--".to_string());
     args.extend(command.iter().map(|entry| (*entry).to_string()));
 
@@ -143,10 +204,30 @@ async fn run_linux_sandbox_direct(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    tokio::time::timeout(Duration::from_millis(timeout_ms), cmd.output())
-        .await
-        .expect("sandbox command should not time out")
-        .expect("sandbox command should execute")
+    cmd
+}
+
+fn clear_close_on_exec(fd: libc::c_int) {
+    // SAFETY: `fd` comes from this process's live `TcpListener`.
+    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    assert!(fd_flags >= 0, "listener fd flags should be readable");
+    // SAFETY: `fd` comes from this process's live `TcpListener`.
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags & !libc::FD_CLOEXEC) };
+    assert_eq!(result, 0, "listener fd should be inherited");
+}
+
+fn connect_sites_preview_browser_stream(port: u16) -> TcpStream {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match TcpStream::connect((Ipv4Addr::LOCALHOST, port)) {
+            Ok(stream) => return stream,
+            Err(error) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+                let _ = error;
+            }
+            Err(error) => panic!("browser should connect to Sites preview listener: {error}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -296,6 +377,108 @@ async fn managed_proxy_mode_denies_af_unix_socket_but_allows_socketpair() {
         output.status.code(),
         Some(0),
         "expected AF_UNIX socket creation to be denied and socketpair to work; status={:?}; stdout={}; stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn sites_preview_routes_browser_connection_into_sandbox_local_server() {
+    if let Some(skip_reason) = sites_preview_skip_reason().await {
+        eprintln!("skipping Sites preview test: {skip_reason}");
+        return;
+    }
+
+    let python_available = Command::new("bash")
+        .arg("-c")
+        .arg("command -v python3 >/dev/null")
+        .status()
+        .await
+        .expect("python3 probe should execute")
+        .success();
+    if !python_available {
+        eprintln!("skipping Sites preview test: python3 is unavailable");
+        return;
+    }
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind browser-visible Sites preview listener");
+    clear_close_on_exec(listener.as_raw_fd());
+    let browser_visible_port = listener
+        .local_addr()
+        .expect("Sites preview listener local addr")
+        .port();
+
+    let mut env = create_env_from_core_vars();
+    strip_proxy_env(&mut env);
+    env.insert(
+        SITES_PREVIEW_LISTENER_FD_ENV_VAR.to_string(),
+        listener.as_raw_fd().to_string(),
+    );
+
+    let server_script = format!(
+        "import http.server\n\
+         class Handler(http.server.BaseHTTPRequestHandler):\n\
+             def do_GET(self):\n\
+                 body = b'sites-preview-ok'\n\
+                 self.send_response(200)\n\
+                 self.send_header('Content-Length', str(len(body)))\n\
+                 self.end_headers()\n\
+                 self.wfile.write(body)\n\
+             def log_message(self, format, *args):\n\
+                 pass\n\
+         server = http.server.ThreadingHTTPServer(('127.0.0.1', {SITES_PREVIEW_PORT}), Handler)\n\
+         server.handle_request()\n"
+    );
+    let command = ["python3", "-c", server_script.as_str()];
+    let mut cmd = linux_sandbox_command(
+        &command,
+        &PermissionProfile::read_only(),
+        /*allow_network_for_proxy*/ false,
+        /*sites_preview*/ true,
+        env,
+    );
+    cmd.kill_on_drop(true);
+    let child = cmd.spawn().expect("Sites preview sandbox should spawn");
+
+    let mut browser_stream = connect_sites_preview_browser_stream(browser_visible_port);
+    browser_stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("set browser read timeout");
+    browser_stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: terminal.local\r\nConnection: close\r\n\r\n")
+        .expect("write browser request");
+    browser_stream
+        .shutdown(Shutdown::Write)
+        .expect("close browser request body");
+    let mut response = Vec::new();
+    let response_result = browser_stream.read_to_end(&mut response);
+    drop(browser_stream);
+
+    let output = tokio::time::timeout(
+        Duration::from_millis(NETWORK_TIMEOUT_MS),
+        child.wait_with_output(),
+    )
+    .await
+    .expect("Sites preview sandbox should exit after one request")
+    .expect("Sites preview sandbox should execute");
+    response_result.unwrap_or_else(|error| {
+        panic!(
+            "read browser response: {error}; status={:?}; stdout={}; stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.contains("sites-preview-ok"),
+        "expected Sites preview response body, got response: {response}"
+    );
+    assert!(
+        output.status.success(),
+        "expected Sites preview sandbox to execute successfully; status={:?}; stdout={}; stderr={}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)

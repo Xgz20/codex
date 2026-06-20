@@ -27,6 +27,7 @@ pub fn create_linux_sandbox_command_args_for_permission_profile(
     sandbox_policy_cwd: &Path,
     use_legacy_landlock: bool,
     allow_network_for_proxy: bool,
+    sites_preview: bool,
 ) -> Vec<String> {
     let permission_profile_json = serde_json::to_string(permission_profile)
         .unwrap_or_else(|err| panic!("failed to serialize permission profile: {err}"));
@@ -48,11 +49,14 @@ pub fn create_linux_sandbox_command_args_for_permission_profile(
         permission_profile_json,
     ];
     // Proxy-only networking requires bubblewrap's isolated network namespace.
-    if use_legacy_landlock && !allow_network_for_proxy {
+    if use_legacy_landlock && !allow_network_for_proxy && !sites_preview {
         linux_cmd.push("--use-legacy-landlock".to_string());
     }
     if allow_network_for_proxy {
         linux_cmd.push("--allow-network-for-proxy".to_string());
+    }
+    if sites_preview {
+        linux_cmd.push("--sites-preview".to_string());
     }
     linux_cmd.push("--".to_string());
     linux_cmd.extend(command);
@@ -68,6 +72,7 @@ fn create_linux_sandbox_command_args(
     sandbox_policy_cwd: &Path,
     use_legacy_landlock: bool,
     allow_network_for_proxy: bool,
+    sites_preview: bool,
 ) -> Vec<String> {
     let command_cwd = command_cwd
         .to_str()
@@ -85,11 +90,14 @@ fn create_linux_sandbox_command_args(
         command_cwd,
     ];
     // Proxy-only networking requires bubblewrap's isolated network namespace.
-    if use_legacy_landlock && !allow_network_for_proxy {
+    if use_legacy_landlock && !allow_network_for_proxy && !sites_preview {
         linux_cmd.push("--use-legacy-landlock".to_string());
     }
     if allow_network_for_proxy {
         linux_cmd.push("--allow-network-for-proxy".to_string());
+    }
+    if sites_preview {
+        linux_cmd.push("--sites-preview".to_string());
     }
 
     // Separator so that command arguments starting with `-` are not parsed as

@@ -102,6 +102,7 @@ pub(crate) struct ExecCommandRequest {
     pub shell_mode: UnifiedExecShellMode,
     pub network: Option<NetworkProxy>,
     pub tty: bool,
+    pub sites_preview: bool,
     pub sandbox_permissions: SandboxPermissions,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
     pub additional_permissions_preapproved: bool,

@@ -25,6 +25,8 @@ use crate::launcher::exec_bwrap;
 use crate::launcher::preferred_bwrap_supports_argv0;
 use crate::proxy_routing::activate_proxy_routes_in_netns;
 use crate::proxy_routing::prepare_host_proxy_route_spec;
+use crate::sites_preview::activate_sites_preview;
+use crate::sites_preview::take_sites_preview_listener_fd_from_env;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::FileSystemSandboxPolicy;
@@ -126,6 +128,10 @@ pub struct LandlockCommand {
     #[arg(long = "proxy-route-spec", hide = true)]
     pub proxy_route_spec: Option<String>,
 
+    /// Internal: expose the fixed Sites preview port through an inherited listener.
+    #[arg(long = "sites-preview", hide = true, default_value_t = false)]
+    pub sites_preview: bool,
+
     /// When set, skip mounting a fresh `/proc` even though PID isolation is
     /// still enabled. This is primarily intended for restrictive container
     /// environments that deny `--proc /proc`.
@@ -153,6 +159,7 @@ pub fn run_main() -> ! {
         apply_seccomp_then_exec,
         allow_network_for_proxy,
         proxy_route_spec,
+        sites_preview,
         no_proc,
         command,
     } = LandlockCommand::parse();
@@ -161,6 +168,7 @@ pub fn run_main() -> ! {
         panic!("No command specified to execute.");
     }
     ensure_inner_stage_mode_is_valid(apply_seccomp_then_exec, use_legacy_landlock);
+    ensure_sites_preview_mode_is_valid(sites_preview, use_legacy_landlock);
     let EffectivePermissions {
         permission_profile,
         file_system_sandbox_policy,
@@ -176,6 +184,14 @@ pub fn run_main() -> ! {
     // Inner stage: apply seccomp/no_new_privs after bubblewrap has already
     // established the filesystem view.
     if apply_seccomp_then_exec {
+        if sites_preview {
+            let listener_fd = take_sites_preview_listener_fd_from_env()
+                .unwrap_or_else(|err| panic!("error resolving Sites preview listener fd: {err}"))
+                .unwrap_or_else(|| panic!("Sites preview requires inherited listener fd"));
+            if let Err(err) = activate_sites_preview(listener_fd) {
+                panic!("error activating Sites preview bridge: {err}");
+            }
+        }
         if allow_network_for_proxy {
             let spec = proxy_route_spec
                 .as_deref()
@@ -184,26 +200,29 @@ pub fn run_main() -> ! {
                 panic!("error activating Linux proxy routing bridge: {err}");
             }
         }
-        let proxy_routing_active = allow_network_for_proxy;
+        let allow_ip_sockets_in_isolated_network = allow_network_for_proxy || sites_preview;
         if let Err(e) = apply_permission_profile_to_current_thread(
             &permission_profile,
             &sandbox_policy_cwd,
             /*apply_landlock_fs*/ false,
             allow_network_for_proxy,
-            proxy_routing_active,
+            allow_ip_sockets_in_isolated_network,
         ) {
             panic!("error applying Linux sandbox restrictions: {e:?}");
         }
         exec_or_panic(command);
     }
 
-    if file_system_sandbox_policy.has_full_disk_write_access() && !allow_network_for_proxy {
+    if file_system_sandbox_policy.has_full_disk_write_access()
+        && !allow_network_for_proxy
+        && !sites_preview
+    {
         if let Err(e) = apply_permission_profile_to_current_thread(
             &permission_profile,
             &sandbox_policy_cwd,
             /*apply_landlock_fs*/ false,
             allow_network_for_proxy,
-            /*proxy_routed_network*/ false,
+            /*allow_ip_sockets_in_isolated_network*/ false,
         ) {
             panic!("error applying Linux sandbox restrictions: {e:?}");
         }
@@ -228,6 +247,7 @@ pub fn run_main() -> ! {
             permission_profile: &permission_profile,
             allow_network_for_proxy,
             proxy_route_spec,
+            sites_preview,
             command,
         });
         run_bwrap_with_proc_fallback(
@@ -247,7 +267,7 @@ pub fn run_main() -> ! {
         &sandbox_policy_cwd,
         /*apply_landlock_fs*/ true,
         allow_network_for_proxy,
-        /*proxy_routed_network*/ false,
+        /*allow_ip_sockets_in_isolated_network*/ false,
     ) {
         panic!("error applying legacy Linux sandbox restrictions: {e:?}");
     }
@@ -295,6 +315,12 @@ fn resolve_permission_profile(
 fn ensure_inner_stage_mode_is_valid(apply_seccomp_then_exec: bool, use_legacy_landlock: bool) {
     if apply_seccomp_then_exec && use_legacy_landlock {
         panic!("--apply-seccomp-then-exec is incompatible with --use-legacy-landlock");
+    }
+}
+
+fn ensure_sites_preview_mode_is_valid(sites_preview: bool, use_legacy_landlock: bool) {
+    if sites_preview && use_legacy_landlock {
+        panic!("--sites-preview requires bubblewrap mode");
     }
 }
 
@@ -1394,6 +1420,7 @@ struct InnerSeccompCommandArgs<'a> {
     permission_profile: &'a PermissionProfile,
     allow_network_for_proxy: bool,
     proxy_route_spec: Option<String>,
+    sites_preview: bool,
     command: Vec<String>,
 }
 
@@ -1405,6 +1432,7 @@ fn build_inner_seccomp_command(args: InnerSeccompCommandArgs<'_>) -> Vec<String>
         permission_profile,
         allow_network_for_proxy,
         proxy_route_spec,
+        sites_preview,
         command,
     } = args;
     let current_exe = match std::env::current_exe() {
@@ -1436,6 +1464,9 @@ fn build_inner_seccomp_command(args: InnerSeccompCommandArgs<'_>) -> Vec<String>
             .unwrap_or_else(|| panic!("managed proxy mode requires a proxy route spec"));
         inner.push("--proxy-route-spec".to_string());
         inner.push(proxy_route_spec);
+    }
+    if sites_preview {
+        inner.push("--sites-preview".to_string());
     }
     inner.push("--".to_string());
     inner.extend(command);

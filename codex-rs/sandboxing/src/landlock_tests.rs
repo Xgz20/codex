@@ -13,6 +13,7 @@ fn legacy_landlock_flag_is_included_when_requested() {
         cwd,
         /*use_legacy_landlock*/ false,
         /*allow_network_for_proxy*/ false,
+        /*sites_preview*/ false,
     );
     assert_eq!(
         default_bwrap.contains(&"--use-legacy-landlock".to_string()),
@@ -25,6 +26,7 @@ fn legacy_landlock_flag_is_included_when_requested() {
         cwd,
         /*use_legacy_landlock*/ true,
         /*allow_network_for_proxy*/ false,
+        /*sites_preview*/ false,
     );
     assert_eq!(
         legacy_landlock.contains(&"--use-legacy-landlock".to_string()),
@@ -46,6 +48,7 @@ fn proxy_flag_takes_precedence_over_legacy_landlock() {
         cwd,
         /*use_legacy_landlock*/ true,
         /*allow_network_for_proxy*/ true,
+        /*sites_preview*/ false,
     );
     assert_eq!(
         args.contains(&"--allow-network-for-proxy".to_string()),
@@ -68,6 +71,7 @@ fn permission_profile_flag_is_included() {
         cwd,
         /*use_legacy_landlock*/ true,
         /*allow_network_for_proxy*/ false,
+        /*sites_preview*/ false,
     );
 
     assert_eq!(
@@ -92,4 +96,23 @@ fn proxy_network_requires_managed_requirements() {
         allow_network_for_proxy(/*enforce_managed_network*/ true),
         true
     );
+}
+
+#[test]
+fn sites_preview_forces_bubblewrap_bridge_flag() {
+    let command = vec!["/bin/true".to_string()];
+    let command_cwd = Path::new("/tmp/link");
+    let cwd = Path::new("/tmp");
+
+    let args = create_linux_sandbox_command_args(
+        command,
+        command_cwd,
+        cwd,
+        /*use_legacy_landlock*/ true,
+        /*allow_network_for_proxy*/ false,
+        /*sites_preview*/ true,
+    );
+
+    assert_eq!(args.contains(&"--sites-preview".to_string()), true);
+    assert_eq!(args.contains(&"--use-legacy-landlock".to_string()), false);
 }

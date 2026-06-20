@@ -43,6 +43,13 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
             )),
         ),
         (
+            "sites_preview".to_string(),
+            JsonSchema::boolean(Some(
+                "Expose the fixed Sites preview server port from the Linux sandbox."
+                    .to_string(),
+            )),
+        ),
+        (
             "yield_time_ms".to_string(),
             JsonSchema::number(Some(
                 "Wait before yielding output. Defaults to 10000 ms; effective range is 250-30000 ms.".to_string(),

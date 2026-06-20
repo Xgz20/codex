@@ -41,6 +41,7 @@ where
         sandbox_policy_cwd,
         use_legacy_landlock,
         allow_network_for_proxy(/*enforce_managed_network*/ false),
+        /*sites_preview*/ false,
     );
     let codex_linux_sandbox_exe = codex_linux_sandbox_exe.as_ref();
     // Preserve the helper alias when we already have it; otherwise force argv0

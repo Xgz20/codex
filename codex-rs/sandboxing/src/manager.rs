@@ -114,6 +114,7 @@ pub struct SandboxExecRequest {
     pub cwd: PathUri,
     pub sandbox_policy_cwd: PathUri,
     pub env: HashMap<String, String>,
+    pub sites_preview: bool,
     pub network: Option<NetworkProxy>,
     pub network_environment_id: Option<String>,
     pub sandbox: SandboxType,
@@ -137,6 +138,7 @@ pub struct SandboxTransformRequest<'a> {
     // TODO(viyatb): Evaluate switching this to Option<Arc<NetworkProxy>>
     // to make shared ownership explicit across runtime/sandbox plumbing.
     pub network: Option<&'a NetworkProxy>,
+    pub sites_preview: bool,
     pub sandbox_policy_cwd: &'a PathUri,
     pub codex_linux_sandbox_exe: Option<&'a Path>,
     pub use_legacy_landlock: bool,
@@ -213,6 +215,9 @@ pub enum SandboxTransformError {
     },
     MissingLinuxSandboxExecutable,
     EnvironmentNetworkProxy(String),
+    SitesPreviewRequiresLinuxSandbox,
+    #[cfg(target_os = "linux")]
+    SitesPreviewRequiresIsolatedNetwork,
     #[cfg(target_os = "linux")]
     Wsl1UnsupportedForBubblewrap,
     #[cfg(not(target_os = "macos"))]
@@ -240,6 +245,14 @@ impl std::fmt::Display for SandboxTransformError {
             Self::EnvironmentNetworkProxy(err) => {
                 write!(f, "failed to prepare environment network proxy: {err}")
             }
+            Self::SitesPreviewRequiresLinuxSandbox => {
+                write!(f, "Sites preview requires the Linux sandbox")
+            }
+            #[cfg(target_os = "linux")]
+            Self::SitesPreviewRequiresIsolatedNetwork => write!(
+                f,
+                "Sites preview requires isolated or managed-proxy Linux networking"
+            ),
             #[cfg(target_os = "linux")]
             Self::Wsl1UnsupportedForBubblewrap => write!(f, "{WSL1_BWRAP_WARNING}"),
             #[cfg(not(target_os = "macos"))]
@@ -259,6 +272,9 @@ impl std::error::Error for SandboxTransformError {
             | Self::InvalidSandboxPolicyCwd { source, .. } => Some(source),
             Self::MissingLinuxSandboxExecutable => None,
             Self::EnvironmentNetworkProxy(_) => None,
+            Self::SitesPreviewRequiresLinuxSandbox => None,
+            #[cfg(target_os = "linux")]
+            Self::SitesPreviewRequiresIsolatedNetwork => None,
             #[cfg(target_os = "linux")]
             Self::Wsl1UnsupportedForBubblewrap => None,
             #[cfg(not(target_os = "macos"))]
@@ -329,6 +345,7 @@ impl SandboxManager {
             enforce_managed_network,
             environment_id,
             network,
+            sites_preview,
             sandbox_policy_cwd,
             codex_linux_sandbox_exe,
             use_legacy_landlock,
@@ -350,6 +367,9 @@ impl SandboxManager {
         );
         let (base_file_system_policy, base_network_policy) =
             base_effective_permission_profile.to_runtime_permissions();
+        if sites_preview && sandbox != SandboxType::LinuxSeccomp {
+            return Err(SandboxTransformError::SitesPreviewRequiresLinuxSandbox);
+        }
         let mut argv = Vec::with_capacity(1 + command.args.len());
         argv.push(command.program);
         argv.extend(command.args.into_iter().map(OsString::from));
@@ -392,7 +412,14 @@ impl SandboxManager {
                     &pending.effective_file_system_policy,
                     use_legacy_landlock,
                     allow_proxy_network,
+                    sites_preview,
                     is_wsl1(),
+                )?;
+                #[cfg(target_os = "linux")]
+                ensure_sites_preview_has_isolated_network(
+                    sites_preview,
+                    pending.effective_network_policy,
+                    allow_proxy_network,
                 )?;
                 let mut args = create_linux_sandbox_command_args_for_permission_profile(
                     os_argv_to_strings(argv),
@@ -401,6 +428,7 @@ impl SandboxManager {
                     pending.native_sandbox_policy_cwd.as_path(),
                     use_legacy_landlock,
                     allow_proxy_network,
+                    sites_preview,
                 );
                 let mut full_command = Vec::with_capacity(1 + args.len());
                 full_command.push(os_string_to_command_component(exe.as_os_str().to_owned()));
@@ -449,6 +477,7 @@ impl SandboxManager {
             cwd: command.cwd,
             sandbox_policy_cwd: sandbox_policy_cwd.clone(),
             env: command.env,
+            sites_preview,
             network: network.cloned(),
             network_environment_id: environment_id.map(str::to_string),
             sandbox,
@@ -665,12 +694,27 @@ fn ensure_linux_bubblewrap_is_supported(
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     use_legacy_landlock: bool,
     allow_network_for_proxy: bool,
+    sites_preview: bool,
     is_wsl1: bool,
 ) -> Result<(), SandboxTransformError> {
     let requires_bubblewrap = allow_network_for_proxy
+        || sites_preview
         || (!use_legacy_landlock && !file_system_sandbox_policy.has_full_disk_write_access());
     if is_wsl1 && requires_bubblewrap {
         return Err(SandboxTransformError::Wsl1UnsupportedForBubblewrap);
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_sites_preview_has_isolated_network(
+    sites_preview: bool,
+    network_sandbox_policy: NetworkSandboxPolicy,
+    allow_network_for_proxy: bool,
+) -> Result<(), SandboxTransformError> {
+    if sites_preview && network_sandbox_policy.is_enabled() && !allow_network_for_proxy {
+        return Err(SandboxTransformError::SitesPreviewRequiresIsolatedNetwork);
     }
 
     Ok(())

@@ -6,6 +6,7 @@ mod manager;
 pub mod policy_transforms;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
+pub mod sites_preview;
 mod windows;
 
 #[cfg(target_os = "linux")]
@@ -53,6 +54,17 @@ impl From<SandboxTransformError> for CodexErr {
             }
             SandboxTransformError::EnvironmentNetworkProxy(message) => {
                 CodexErr::UnsupportedOperation(message)
+            }
+            SandboxTransformError::SitesPreviewRequiresLinuxSandbox => {
+                CodexErr::UnsupportedOperation(
+                    "Sites preview requires the Linux sandbox".to_string(),
+                )
+            }
+            #[cfg(target_os = "linux")]
+            SandboxTransformError::SitesPreviewRequiresIsolatedNetwork => {
+                CodexErr::UnsupportedOperation(
+                    "Sites preview requires isolated or managed-proxy Linux networking".to_string(),
+                )
             }
             #[cfg(target_os = "linux")]
             SandboxTransformError::Wsl1UnsupportedForBubblewrap => {

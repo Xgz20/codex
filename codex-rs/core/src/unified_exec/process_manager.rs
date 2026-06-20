@@ -188,6 +188,7 @@ fn exec_server_params_for_request(
         env,
         tty,
         pipe_stdin: false,
+        sites_preview: request.sites_preview,
         arg0: request.arg0.clone(),
         sandbox: request.exec_server_sandbox.clone(),
         enforce_managed_network: request.exec_server_enforce_managed_network,
@@ -920,6 +921,7 @@ impl UnifiedExecProcessManager {
         options: ExecOptions,
         attempt: &SandboxAttempt<'_>,
         network: Option<&NetworkProxy>,
+        sites_preview: bool,
         environment_id: Option<&str>,
         exec_server_env_config: Option<ExecServerEnvConfig>,
         tty: bool,
@@ -927,9 +929,9 @@ impl UnifiedExecProcessManager {
         environment: &codex_exec_server::Environment,
     ) -> Result<UnifiedExecProcess, ToolError> {
         let mut request = if environment.is_remote() {
-            attempt.env_for_exec_server(command, options, network, environment_id)
+            attempt.env_for_exec_server(command, options, network, sites_preview, environment_id)
         } else {
-            attempt.env_for(command, options, network, environment_id)
+            attempt.env_for(command, options, network, sites_preview, environment_id)
         }
         .map_err(ToolError::Codex)?;
         request.exec_server_env_config = exec_server_env_config;
@@ -1063,6 +1065,11 @@ impl UnifiedExecProcessManager {
             spawn_lifecycle.after_spawn();
             return UnifiedExecProcess::from_exec_server_started(started).await;
         }
+        if request.sites_preview {
+            return Err(UnifiedExecError::create_process(
+                "Sites preview requires exec-server".to_string(),
+            ));
+        }
 
         // TODO(anp): Keep PathUri through the local PTY/process launch boundary.
         let native_cwd = request
@@ -1166,6 +1173,7 @@ impl UnifiedExecProcessManager {
                 .clone(),
             network: request.network.clone(),
             tty: request.tty,
+            sites_preview: request.sites_preview,
             sandbox_permissions: request.sandbox_permissions,
             additional_permissions: request.additional_permissions.clone(),
             #[cfg(unix)]
