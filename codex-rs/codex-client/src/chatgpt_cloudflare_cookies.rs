@@ -57,12 +57,13 @@ pub fn with_chatgpt_cloudflare_cookie_store(
     builder.cookie_provider(Arc::clone(&SHARED_CHATGPT_CLOUDFLARE_COOKIE_STORE))
 }
 
-/// Merges stored ChatGPT Cloudflare cookies into an explicit `Cookie` header.
+/// Appends stored ChatGPT Cloudflare cookies alongside explicit `Cookie` headers.
 ///
 /// Reqwest deliberately skips its cookie provider when a request already has a `Cookie` header.
 /// Callers that set one explicitly should invoke this before sending so allowlisted Cloudflare
-/// affinity cookies are preserved alongside their caller-provided cookies. Requests without an
-/// explicit header are left alone for reqwest's cookie provider to handle normally.
+/// affinity cookies are preserved alongside their caller-provided cookies. Existing header fields
+/// are left unchanged, and only stored cookies whose names are not already explicit are appended.
+/// Requests without an explicit header are left alone for reqwest's cookie provider to handle.
 pub fn merge_chatgpt_cloudflare_cookie_header(headers: &mut HeaderMap, url: &reqwest::Url) {
     if !headers.contains_key(COOKIE) {
         return;
@@ -112,20 +113,11 @@ fn merge_cookie_header_from_store(
         return;
     }
 
-    let merged_header = existing_headers
-        .iter()
-        .flat_map(|header| header.split(';'))
-        .map(str::trim)
-        .filter(|cookie| !cookie.is_empty())
-        .chain(stored_cookies)
-        .collect::<Vec<_>>()
-        .join("; ");
-    let Ok(merged_header) = HeaderValue::from_str(&merged_header) else {
+    let Ok(stored_header) = HeaderValue::from_str(&stored_cookies.join("; ")) else {
         return;
     };
 
-    headers.remove(COOKIE);
-    headers.insert(COOKIE, merged_header);
+    headers.append(COOKIE, stored_header);
 }
 
 fn cookie_header_contains_name(header: &str, name: &str) -> bool {
@@ -232,6 +224,37 @@ mod tests {
                 "__cflb=west".to_string(),
                 "_cfuvid=visitor".to_string(),
                 "cf_clearance=clearance".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn appends_cloudflare_cookies_without_collapsing_repeated_cookie_headers() {
+        let store = ChatGptCloudflareCookieStore::default();
+        let url = reqwest::Url::parse("https://chatgpt.com/backend-api/ps/mcp").unwrap();
+        let load_balancer = HeaderValue::from_static("__cflb=stored; Path=/; Secure; HttpOnly");
+        let visitor = HeaderValue::from_static("_cfuvid=visitor; Path=/; Secure; HttpOnly");
+        store.set_cookies(&mut [&load_balancer, &visitor].into_iter(), &url);
+
+        let mut headers = HeaderMap::new();
+        headers.append(
+            COOKIE,
+            HeaderValue::from_static("oai-chat-plugin-service-preview=true"),
+        );
+        headers.append(COOKIE, HeaderValue::from_static("__cflb=explicit"));
+
+        merge_cookie_header_from_store(&mut headers, &url, &store);
+
+        assert_eq!(
+            headers
+                .get_all(COOKIE)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "oai-chat-plugin-service-preview=true",
+                "__cflb=explicit",
+                "_cfuvid=visitor",
             ]
         );
     }
