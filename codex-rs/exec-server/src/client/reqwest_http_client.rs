@@ -9,6 +9,8 @@ use std::error::Error as StdError;
 use std::time::Duration;
 
 use codex_client::build_reqwest_client_with_custom_ca;
+use codex_client::merge_chatgpt_cloudflare_cookie_header;
+use codex_client::with_chatgpt_cloudflare_cookie_store;
 use codex_exec_server_protocol::JSONRPCErrorError;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -66,7 +68,7 @@ impl ReqwestHttpClient {
             HttpRedirectPolicy::Follow => builder,
             HttpRedirectPolicy::Stop => builder.redirect(reqwest::redirect::Policy::none()),
         };
-        build_reqwest_client_with_custom_ca(builder)
+        build_reqwest_client_with_custom_ca(with_chatgpt_cloudflare_cookie_store(builder))
             .map_err(|error| ExecServerError::HttpRequest(error.to_string()))
     }
 }
@@ -158,6 +160,7 @@ impl ReqwestHttpRequestRunner {
         );
         let mut headers = Self::build_headers(params.headers)?;
         codex_otel::inject_span_w3c_trace_headers(&request_span, &mut headers);
+        merge_chatgpt_cloudflare_cookie_header(&mut headers, &url);
         let mut request = self.client.request(method.clone(), url).headers(headers);
         if let Some(body) = params.body {
             request = request.body(body.into_inner());

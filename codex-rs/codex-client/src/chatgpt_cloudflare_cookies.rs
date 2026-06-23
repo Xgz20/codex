@@ -3,6 +3,8 @@ use std::sync::LazyLock;
 
 use reqwest::cookie::CookieStore;
 use reqwest::cookie::Jar;
+use reqwest::header::COOKIE;
+use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
 
 use crate::chatgpt_hosts::is_allowed_chatgpt_host;
@@ -53,6 +55,84 @@ pub fn with_chatgpt_cloudflare_cookie_store(
     builder: reqwest::ClientBuilder,
 ) -> reqwest::ClientBuilder {
     builder.cookie_provider(Arc::clone(&SHARED_CHATGPT_CLOUDFLARE_COOKIE_STORE))
+}
+
+/// Merges stored ChatGPT Cloudflare cookies into an explicit `Cookie` header.
+///
+/// Reqwest deliberately skips its cookie provider when a request already has a `Cookie` header.
+/// Callers that set one explicitly should invoke this before sending so allowlisted Cloudflare
+/// affinity cookies are preserved alongside their caller-provided cookies. Requests without an
+/// explicit header are left alone for reqwest's cookie provider to handle normally.
+pub fn merge_chatgpt_cloudflare_cookie_header(headers: &mut HeaderMap, url: &reqwest::Url) {
+    if !headers.contains_key(COOKIE) {
+        return;
+    }
+
+    merge_cookie_header_from_store(
+        headers,
+        url,
+        SHARED_CHATGPT_CLOUDFLARE_COOKIE_STORE.as_ref(),
+    );
+}
+
+fn merge_cookie_header_from_store(
+    headers: &mut HeaderMap,
+    url: &reqwest::Url,
+    store: &dyn CookieStore,
+) {
+    let Some(stored_header) = store.cookies(url) else {
+        return;
+    };
+    let Ok(stored_header) = stored_header.to_str() else {
+        return;
+    };
+    let Ok(existing_headers) = headers
+        .get_all(COOKIE)
+        .iter()
+        .map(HeaderValue::to_str)
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return;
+    };
+
+    let stored_cookies = stored_header
+        .split(';')
+        .map(str::trim)
+        .filter(|cookie| !cookie.is_empty())
+        .filter(|cookie| {
+            let Some(name) = set_cookie_name(cookie) else {
+                return false;
+            };
+            !existing_headers
+                .iter()
+                .any(|header| cookie_header_contains_name(header, name))
+        })
+        .collect::<Vec<_>>();
+    if stored_cookies.is_empty() {
+        return;
+    }
+
+    let merged_header = existing_headers
+        .iter()
+        .flat_map(|header| header.split(';'))
+        .map(str::trim)
+        .filter(|cookie| !cookie.is_empty())
+        .chain(stored_cookies)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let Ok(merged_header) = HeaderValue::from_str(&merged_header) else {
+        return;
+    };
+
+    headers.remove(COOKIE);
+    headers.insert(COOKIE, merged_header);
+}
+
+fn cookie_header_contains_name(header: &str, name: &str) -> bool {
+    header
+        .split(';')
+        .filter_map(set_cookie_name)
+        .any(|existing_name| existing_name == name)
 }
 
 fn is_chatgpt_cookie_url(url: &reqwest::Url) -> bool {
@@ -128,11 +208,12 @@ mod tests {
     fn stores_and_returns_cloudflare_cookies_for_chatgpt_hosts() {
         let store = ChatGptCloudflareCookieStore::default();
         let url = reqwest::Url::parse("https://chatgpt.com/backend-api/codex/responses").unwrap();
+        let load_balancer = HeaderValue::from_static("__cflb=west; Path=/; Secure; HttpOnly");
         let cfuvid = HeaderValue::from_static("_cfuvid=visitor; Path=/; Secure; HttpOnly");
         let clearance =
             HeaderValue::from_static("cf_clearance=clearance; Path=/; Secure; HttpOnly");
 
-        store.set_cookies(&mut [&cfuvid, &clearance].into_iter(), &url);
+        store.set_cookies(&mut [&load_balancer, &cfuvid, &clearance].into_iter(), &url);
 
         let mut cookies = store
             .cookies(&url)
@@ -148,6 +229,7 @@ mod tests {
         assert_eq!(
             cookies,
             vec![
+                "__cflb=west".to_string(),
                 "_cfuvid=visitor".to_string(),
                 "cf_clearance=clearance".to_string()
             ]
