@@ -573,7 +573,7 @@ if (!tool) {
     .await;
 
     let apps_base_url = apps_server.chatgpt_base_url.clone();
-    let mut builder = test_codex()
+    let mut builder = search_capable_apps_builder(apps_base_url)
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(move |config| {
             config
@@ -595,7 +595,6 @@ if (!tool) {
                 .iter_mut()
                 .find(|model| model.slug == "gpt-5.4")
                 .expect("gpt-5.4 exists in bundled models.json");
-            config.chatgpt_base_url = apps_base_url;
             config.model = Some("gpt-5.4".to_string());
             model.supports_search_tool = true;
             config.model_catalog = Some(model_catalog);

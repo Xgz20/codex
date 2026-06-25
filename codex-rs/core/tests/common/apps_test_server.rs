@@ -7,8 +7,12 @@ use codex_login::CodexAuth;
 use codex_models_manager::bundled_models_response;
 use serde_json::Value;
 use serde_json::json;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use tokio::sync::Notify;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::Request;
@@ -32,6 +36,7 @@ const SEARCHABLE_TOOL_COUNT: usize = 100;
 const CALENDAR_CREATE_EVENT_TOOL_NAME: &str = "calendar_create_event";
 const CALENDAR_APP_ONLY_TOOL_NAME: &str = "calendar_app_only_action";
 pub const CALENDAR_EXTRACT_TEXT_TOOL_NAME: &str = "calendar_extract_text";
+pub const CALENDAR_UPSTREAM_ERROR_TITLE: &str = "return an upstream Apps error";
 const CALENDAR_LIST_EVENTS_TOOL_NAME: &str = "calendar_list_events";
 pub const DIRECT_CALENDAR_CREATE_EVENT_TOOL: &str = "mcp__codex_apps__calendar__create_event";
 pub const DIRECT_CALENDAR_APP_ONLY_TOOL: &str = "mcp__codex_apps__calendar__app_only_action";
@@ -61,6 +66,96 @@ pub enum AppsTestToolLoading {
     Searchable,
 }
 
+#[derive(Default)]
+struct AppsToolsListGateState {
+    entered: bool,
+    released: bool,
+}
+
+#[derive(Default)]
+struct AppsToolsListGateInner {
+    state: Mutex<AppsToolsListGateState>,
+    entered: Notify,
+    released: Condvar,
+}
+
+/// Explicitly blocks the hosted Apps `tools/list` response until the test releases it.
+pub struct AppsToolsListGate {
+    inner: Arc<AppsToolsListGateInner>,
+}
+
+#[derive(Clone)]
+pub struct AppsToolsListGateObserver {
+    inner: Arc<AppsToolsListGateInner>,
+}
+
+impl AppsToolsListGate {
+    pub async fn wait_until_entered(&self) {
+        loop {
+            let entered = self.inner.entered.notified();
+            if self
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .entered
+            {
+                return;
+            }
+            entered.await;
+        }
+    }
+
+    pub fn release(&self) {
+        self.inner.release();
+    }
+
+    pub fn observer(&self) -> AppsToolsListGateObserver {
+        AppsToolsListGateObserver {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl Drop for AppsToolsListGate {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl AppsToolsListGateObserver {
+    pub fn is_released(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .released
+    }
+}
+
+impl AppsToolsListGateInner {
+    fn block(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.entered {
+            return;
+        }
+        state.entered = true;
+        self.entered.notify_waiters();
+        while !state.released {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.released = true;
+        self.released.notify_all();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum AppsTestToolsListBehavior {
     AlwaysAvailable,
@@ -82,7 +177,9 @@ impl AppsTestServer {
             CONNECTOR_DESCRIPTION.to_string(),
             /*searchable*/ true,
             /*include_app_only_tool*/ false,
+            /*synthetic_only*/ false,
             AppsTestToolsListBehavior::AlwaysAvailable,
+            /*tools_list_gate*/ None,
         )
         .await;
         Ok(Self {
@@ -102,7 +199,9 @@ impl AppsTestServer {
             CONNECTOR_DESCRIPTION.to_string(),
             /*searchable*/ false,
             /*include_app_only_tool*/ false,
+            /*synthetic_only*/ false,
             AppsTestToolsListBehavior::AlwaysAvailable,
+            /*tools_list_gate*/ None,
         )
         .await;
         Ok(Self {
@@ -122,7 +221,9 @@ impl AppsTestServer {
             CONNECTOR_DESCRIPTION.to_string(),
             matches!(tool_loading, AppsTestToolLoading::Searchable),
             /*include_app_only_tool*/ true,
+            /*synthetic_only*/ false,
             AppsTestToolsListBehavior::AlwaysAvailable,
+            /*tools_list_gate*/ None,
         )
         .await;
         Ok(Self {
@@ -138,6 +239,52 @@ impl AppsTestServer {
             AppsTestToolsListBehavior::AvailableAfterInitialList,
         )
         .await
+    }
+
+    pub async fn mount_with_synthetic_tools_available_after_initial_list(
+        server: &MockServer,
+    ) -> Result<Self> {
+        mount_oauth_metadata(server).await;
+        mount_connectors_directory(server).await;
+        mount_streamable_http_json_rpc(
+            server,
+            CONNECTOR_NAME.to_string(),
+            CONNECTOR_DESCRIPTION.to_string(),
+            /*searchable*/ false,
+            /*include_app_only_tool*/ false,
+            /*synthetic_only*/ true,
+            AppsTestToolsListBehavior::AvailableAfterInitialList,
+            /*tools_list_gate*/ None,
+        )
+        .await;
+        Ok(Self {
+            chatgpt_base_url: server.uri(),
+        })
+    }
+
+    pub async fn mount_with_tools_list_gate(
+        server: &MockServer,
+    ) -> Result<(Self, AppsToolsListGate)> {
+        mount_oauth_metadata(server).await;
+        mount_connectors_directory(server).await;
+        let inner = Arc::new(AppsToolsListGateInner::default());
+        mount_streamable_http_json_rpc(
+            server,
+            CONNECTOR_NAME.to_string(),
+            CONNECTOR_DESCRIPTION.to_string(),
+            /*searchable*/ true,
+            /*include_app_only_tool*/ false,
+            /*synthetic_only*/ false,
+            AppsTestToolsListBehavior::AlwaysAvailable,
+            Some(Arc::clone(&inner)),
+        )
+        .await;
+        Ok((
+            Self {
+                chatgpt_base_url: server.uri(),
+            },
+            AppsToolsListGate { inner },
+        ))
     }
 
     pub async fn mount_without_tools(server: &MockServer) -> Result<Self> {
@@ -157,7 +304,9 @@ impl AppsTestServer {
             CONNECTOR_DESCRIPTION.to_string(),
             /*searchable*/ false,
             /*include_app_only_tool*/ false,
+            /*synthetic_only*/ false,
             tools_list_behavior,
+            /*tools_list_gate*/ None,
         )
         .await;
         Ok(Self {
@@ -195,6 +344,7 @@ pub fn apps_enabled_builder(apps_base_url: impl Into<String>) -> TestCodexBuilde
     let apps_base_url = apps_base_url.into();
     test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_extension_factory(apps_extensions)
         .with_config(move |config| configure_apps(config, apps_base_url.as_str()))
 }
 
@@ -202,7 +352,54 @@ pub fn search_capable_apps_builder(apps_base_url: impl Into<String>) -> TestCode
     let apps_base_url = apps_base_url.into();
     test_codex()
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_extension_factory(apps_extensions)
         .with_config(move |config| configure_search_capable_apps(config, apps_base_url.as_str()))
+}
+
+pub fn search_capable_apps_builder_with_analytics(
+    apps_base_url: impl Into<String>,
+) -> TestCodexBuilder {
+    let apps_base_url = apps_base_url.into();
+    let analytics_base_url = apps_base_url.clone();
+    test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_extension_factory(
+            move |auth_manager, environment_manager, plugins_manager, _config| {
+                let analytics_events_client = codex_analytics::AnalyticsEventsClient::new(
+                    Arc::clone(&auth_manager),
+                    analytics_base_url.clone(),
+                    /*analytics_enabled*/ None,
+                );
+                let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+                let service = Arc::new(
+                    codex_mcp_extension::CodexAppsMcpExtension::new_with_analytics(
+                        auth_manager,
+                        environment_manager,
+                        plugins_manager,
+                        analytics_events_client,
+                    ),
+                );
+                codex_mcp_extension::install(&mut extensions, service);
+                Arc::new(extensions.build())
+            },
+        )
+        .with_config(move |config| configure_search_capable_apps(config, apps_base_url.as_str()))
+}
+
+fn apps_extensions(
+    auth_manager: std::sync::Arc<codex_login::AuthManager>,
+    environment_manager: std::sync::Arc<codex_exec_server::EnvironmentManager>,
+    plugins_manager: std::sync::Arc<codex_core_plugins::PluginsManager>,
+    _config: &Config,
+) -> std::sync::Arc<codex_extension_api::ExtensionRegistry<Config>> {
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    let service = std::sync::Arc::new(codex_mcp_extension::CodexAppsMcpExtension::new(
+        auth_manager,
+        environment_manager,
+        plugins_manager,
+    ));
+    codex_mcp_extension::install(&mut extensions, service);
+    std::sync::Arc::new(extensions.build())
 }
 
 fn apps_tool_call_id(body: &Value) -> Option<&str> {
@@ -221,7 +418,7 @@ pub async fn recorded_apps_tool_calls(server: &MockServer) -> Vec<Value> {
         .into_iter()
         .filter_map(|request| {
             let body: Value = serde_json::from_slice(&request.body).ok()?;
-            (request.url.path() == "/api/codex/apps"
+            (request.url.path() == "/api/codex/ps/mcp"
                 && body.get("method").and_then(Value::as_str) == Some("tools/call"))
             .then_some(body)
         })
@@ -311,17 +508,21 @@ async fn mount_streamable_http_json_rpc(
     connector_description: String,
     searchable: bool,
     include_app_only_tool: bool,
+    synthetic_only: bool,
     tools_list_behavior: AppsTestToolsListBehavior,
+    tools_list_gate: Option<Arc<AppsToolsListGateInner>>,
 ) {
     Mock::given(method("POST"))
-        .and(path_regex("^/api/codex/apps/?$"))
+        .and(path_regex("^/api/codex/ps/mcp/?$"))
         .respond_with(CodexAppsJsonRpcResponder {
             connector_name,
             connector_description,
             searchable,
             include_app_only_tool,
+            synthetic_only,
             tools_list_behavior,
             tools_list_calls: AtomicUsize::new(0),
+            tools_list_gate,
         })
         .mount(server)
         .await;
@@ -332,8 +533,10 @@ struct CodexAppsJsonRpcResponder {
     connector_description: String,
     searchable: bool,
     include_app_only_tool: bool,
+    synthetic_only: bool,
     tools_list_behavior: AppsTestToolsListBehavior,
     tools_list_calls: AtomicUsize,
+    tools_list_gate: Option<Arc<AppsToolsListGateInner>>,
 }
 
 impl Respond for CodexAppsJsonRpcResponder {
@@ -379,6 +582,9 @@ impl Respond for CodexAppsJsonRpcResponder {
             }
             "notifications/initialized" => ResponseTemplate::new(202),
             "tools/list" => {
+                if let Some(gate) = &self.tools_list_gate {
+                    gate.block();
+                }
                 let list_index = self.tools_list_calls.fetch_add(1, Ordering::SeqCst);
                 let tools_available = match self.tools_list_behavior {
                     AppsTestToolsListBehavior::AlwaysAvailable => true,
@@ -494,6 +700,19 @@ impl Respond for CodexAppsJsonRpcResponder {
                     tools.clear();
                 }
                 if tools_available
+                    && self.synthetic_only
+                    && let Some(tools) = response
+                        .pointer_mut("/result/tools")
+                        .and_then(Value::as_array_mut)
+                {
+                    for tool in tools {
+                        tool.pointer_mut("/_meta/_codex_apps")
+                            .and_then(Value::as_object_mut)
+                            .expect("test tool has private Apps metadata")
+                            .insert("synthetic_link".to_string(), Value::Bool(true));
+                    }
+                }
+                if tools_available
                     && self.searchable
                     && let Some(tools) = response
                         .pointer_mut("/result/tools")
@@ -566,6 +785,7 @@ impl Respond for CodexAppsJsonRpcResponder {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let codex_apps_meta = body.pointer("/params/_meta/_codex_apps").cloned();
+                let is_error = title == CALENDAR_UPSTREAM_ERROR_TITLE;
 
                 ResponseTemplate::new(200).set_body_json(json!({
                     "jsonrpc": "2.0",
@@ -578,7 +798,7 @@ impl Respond for CodexAppsJsonRpcResponder {
                         "structuredContent": {
                             "_codex_apps": codex_apps_meta,
                         },
-                        "isError": false
+                        "isError": is_error
                     }
                 }))
             }

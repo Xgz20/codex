@@ -571,8 +571,8 @@ async fn tool_search_returns_deferred_tools_without_follow_up_tool_injection() -
     assert_eq!(
         end.invocation,
         McpInvocation {
-            server: "codex_apps".to_string(),
-            tool: "calendar_create_event".to_string(),
+            server: "codex_apps__calendar".to_string(),
+            tool: SEARCH_CALENDAR_CREATE_TOOL.to_string(),
             arguments: Some(json!({
                 "title": "Lunch",
                 "starts_at": "2026-03-10T12:00:00Z"

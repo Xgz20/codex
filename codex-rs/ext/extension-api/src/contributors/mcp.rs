@@ -1,17 +1,18 @@
 use codex_config::McpServerConfig;
+use codex_mcp::EffectiveMcpServer;
 
 use crate::ExtensionData;
 use crate::ExtensionDataInit;
 
 /// Input supplied while resolving MCP server contributions.
 ///
-/// Thread-scoped implementations can read stable host inputs through [`Self::thread_init`] and
-/// keep their cache in [`Self::thread_store`]. Implementations should not retain borrowed context
-/// after contribution completes.
+/// Thread-scoped implementations can read stable host inputs through [`Self::thread_init`]. Model
+/// step implementations can keep a cache in [`Self::thread_store`]. Implementations should not
+/// retain borrowed context after contribution completes.
 pub struct McpServerContributionContext<'a, C> {
     /// Host configuration visible during MCP resolution.
     config: &'a C,
-    /// Extension-owned data for the active thread, when resolution is thread-scoped.
+    /// Extension-owned data for the active thread, when resolving a model step.
     thread_store: Option<&'a ExtensionData>,
     /// Stable host inputs for the active thread, when resolution is thread-scoped.
     thread_init: Option<&'a ExtensionDataInit>,
@@ -38,6 +39,16 @@ impl<'a, C> McpServerContributionContext<'a, C> {
         }
     }
 
+    /// Creates context for a thread-scoped operation outside a model step.
+    pub fn for_thread(config: &'a C, thread_init: &'a ExtensionDataInit) -> Self {
+        Self {
+            config,
+            thread_store: None,
+            thread_init: Some(thread_init),
+            available_environment_ids: None,
+        }
+    }
+
     /// Creates context for one model step using only currently available environments.
     pub fn for_step(
         config: &'a C,
@@ -58,7 +69,7 @@ impl<'a, C> McpServerContributionContext<'a, C> {
         self.config
     }
 
-    /// Returns extension-owned state when resolving for a running thread.
+    /// Returns extension-owned state when resolving a model step.
     pub fn thread_store(&self) -> Option<&'a ExtensionData> {
         self.thread_store
     }
@@ -85,6 +96,11 @@ pub enum McpServerContribution {
         name: String,
         config: Box<McpServerConfig>,
     },
+    /// Adds or replaces a named MCP server whose runtime-only state must not be serialized.
+    SetEffective {
+        name: String,
+        server: Box<EffectiveMcpServer>,
+    },
     /// Registers a server declared by a plugin selected for this thread.
     SelectedPlugin {
         name: String,
@@ -93,12 +109,17 @@ pub enum McpServerContribution {
         selection_order: usize,
         config: Box<McpServerConfig>,
     },
-    /// Adds connector IDs declared by a plugin selected for this thread.
-    SelectedPluginConnectors {
-        plugin_id: String,
-        plugin_display_name: String,
-        connector_ids: Vec<String>,
-    },
     /// Removes a named MCP server.
     Remove { name: String },
+}
+
+/// MCP overlays paired with the contributor revision observed before resolution began.
+///
+/// Capturing the revision first means a publication that races contribution leaves the host with
+/// an older stored revision, so the next safe-boundary comparison deterministically rebuilds the
+/// runtime.
+#[derive(Clone, Debug)]
+pub struct McpServerContributions {
+    pub revision: u64,
+    pub contributions: Vec<McpServerContribution>,
 }

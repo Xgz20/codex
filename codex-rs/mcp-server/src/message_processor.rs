@@ -6,7 +6,7 @@ use codex_core::StateDbHandle;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_exec_server::EnvironmentManager;
-use codex_extension_api::empty_extension_registry;
+use codex_extension_api::ExtensionRegistryBuilder;
 use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::AuthManager;
 use codex_login::default_client::USER_AGENT_SUFFIX;
@@ -43,6 +43,7 @@ pub(crate) struct MessageProcessor {
     initialized: bool,
     arg0_paths: Arg0DispatchPaths,
     thread_manager: Arc<ThreadManager>,
+    codex_apps: Arc<codex_mcp_extension::CodexAppsMcpExtension>,
     running_requests_id_to_codex_uuid: Arc<Mutex<HashMap<RequestId, ThreadId>>>,
 }
 
@@ -66,12 +67,25 @@ impl MessageProcessor {
         let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
             config.codex_home.clone(),
         ));
-        let thread_manager = Arc::new(ThreadManager::new(
+        let plugins_manager = codex_core::build_plugins_manager(
+            config.as_ref(),
+            auth_manager.as_ref(),
+            &SessionSource::Mcp,
+        );
+        let codex_apps = Arc::new(codex_mcp_extension::CodexAppsMcpExtension::new(
+            Arc::clone(&auth_manager),
+            Arc::clone(&environment_manager),
+            Arc::clone(&plugins_manager),
+        ));
+        let mut extensions = ExtensionRegistryBuilder::new();
+        codex_mcp_extension::install(&mut extensions, Arc::clone(&codex_apps));
+        let thread_manager = Arc::new(ThreadManager::new_with_plugins_manager(
             config.as_ref(),
             auth_manager,
+            plugins_manager,
             SessionSource::Mcp,
             environment_manager,
-            empty_extension_registry(),
+            Arc::new(extensions.build()),
             user_instructions_provider,
             /*analytics_events_client*/ None,
             codex_core::thread_store_from_config(config.as_ref(), state_db.clone()),
@@ -85,8 +99,13 @@ impl MessageProcessor {
             initialized: false,
             arg0_paths,
             thread_manager,
+            codex_apps,
             running_requests_id_to_codex_uuid: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.codex_apps.shutdown().await;
     }
 
     pub(crate) async fn process_request(&mut self, request: JsonRpcRequest<ClientRequest>) {

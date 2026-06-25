@@ -7,6 +7,7 @@ use crate::agent::AgentControl;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::attestation::AttestationProvider;
 use crate::client::ModelClient;
+use crate::config::Config;
 use crate::config::NetworkProxyAuditMetadata;
 use crate::config::StartedNetworkProxy;
 use crate::current_time::TimeProvider;
@@ -14,6 +15,8 @@ use crate::environment_selection::ThreadEnvironments;
 use crate::exec_policy::ExecPolicyManager;
 use crate::guardian::GuardianRejection;
 use crate::guardian::GuardianRejectionCircuitBreaker;
+use crate::mcp::McpConfiguredBase;
+use crate::mcp::McpContributorsRevision;
 use crate::mcp::McpManager;
 use crate::session::McpRuntimeSnapshot;
 use crate::tools::code_mode::CodeModeService;
@@ -25,6 +28,8 @@ use anyhow::Result;
 use arc_swap::ArcSwap;
 use arc_swap::ArcSwapOption;
 use codex_analytics::AnalyticsEventsClient;
+use codex_config::types::AuthKeyringBackendKind;
+use codex_config::types::OAuthCredentialsStoreMode;
 use codex_core_plugins::PluginsManager;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionDataInit;
@@ -46,14 +51,44 @@ use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+/// Inputs that produced the currently installed MCP runtime.
+///
+/// `contributor_config` is the session config used to evaluate contributor policy. It is
+/// intentionally independent from `configured_base`: callers such as skill dependency install
+/// may temporarily supply a different sourceful base without changing session policy.
+/// A contributor revision can race a config change, so neither value alone is enough to decide
+/// whether the installed runtime is current.
+pub(crate) struct McpRuntimePublication {
+    pub(crate) contributor_config: Arc<Config>,
+    pub(crate) configured_base: McpConfiguredBase,
+    pub(crate) store_mode: OAuthCredentialsStoreMode,
+    pub(crate) keyring_backend_kind: AuthKeyringBackendKind,
+    pub(crate) contributors_revision: McpContributorsRevision,
+    pub(crate) runtime_context: McpRuntimeContext,
+}
+
+impl McpRuntimePublication {
+    pub(crate) fn matches(
+        &self,
+        contributor_config: &Arc<Config>,
+        contributors_revision: &McpContributorsRevision,
+        runtime_context: &McpRuntimeContext,
+    ) -> bool {
+        Arc::ptr_eq(&self.contributor_config, contributor_config)
+            && &self.contributors_revision == contributors_revision
+            && self
+                .runtime_context
+                .has_same_launch_context(runtime_context)
+    }
+}
+
 pub(crate) struct SessionServices {
     /// Mirror of the latest manager for extension resource clients that predate runtime snapshots.
     pub(crate) mcp_connection_manager: Arc<ArcSwap<McpConnectionManager>>,
     /// The latest atomically published MCP config and manager pair.
     pub(crate) mcp_runtime: ArcSwapOption<McpRuntimeSnapshot>,
-    /// Serializes environment-driven runtime rebuilds.
-    pub(crate) mcp_projection_lock: Mutex<()>,
     pub(crate) mcp_startup_cancellation_token: Mutex<CancellationToken>,
+    pub(crate) mcp_refresh_lock: Mutex<()>,
     pub(crate) unified_exec_manager: UnifiedExecProcessManager,
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) shell_zsh_path: Option<PathBuf>,
@@ -76,6 +111,7 @@ pub(crate) struct SessionServices {
     pub(crate) agents_md_manager: Arc<AgentsMdManager>,
     pub(crate) plugins_manager: Arc<PluginsManager>,
     pub(crate) mcp_manager: Arc<McpManager>,
+    pub(crate) mcp_runtime_publication: Mutex<McpRuntimePublication>,
     pub(crate) extensions: Arc<ExtensionRegistry<crate::config::Config>>,
     pub(crate) session_extension_data: ExtensionData,
     pub(crate) thread_extension_data: ExtensionData,
