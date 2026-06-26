@@ -775,6 +775,11 @@ impl Session {
             })
         };
         self.send_event(turn_context.as_ref(), event).await;
+        // Regular items were flushed before this terminal event was appended; buffering
+        // thread writers may not flush it without another explicit barrier.
+        if let Err(err) = self.flush_rollout().await {
+            warn!("failed to flush rollout after emitting terminal turn event: {err}");
+        }
         self.services
             .guardian_rejection_circuit_breaker
             .lock()
@@ -891,6 +896,11 @@ impl Session {
             duration_ms,
         });
         self.send_event(task.turn_context.as_ref(), event).await;
+        // Regular items were flushed before this terminal event was appended; buffering
+        // thread writers may not flush it without another explicit barrier.
+        if let Err(err) = self.flush_rollout().await {
+            warn!("failed to flush rollout after emitting terminal turn event: {err}");
+        }
         self.services
             .guardian_rejection_circuit_breaker
             .lock()
