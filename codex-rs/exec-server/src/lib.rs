@@ -27,8 +27,6 @@ mod rpc;
 mod runtime_paths;
 mod sandboxed_file_system;
 mod server;
-#[cfg(unix)]
-mod sites_preview;
 mod telemetry;
 use codex_exec_server_protocol as protocol;
 

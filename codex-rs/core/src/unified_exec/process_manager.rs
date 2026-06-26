@@ -62,6 +62,12 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_sandboxing::SandboxCommand;
+#[cfg(unix)]
+use codex_sandboxing::sites_preview::SITES_PREVIEW_PORT;
+#[cfg(unix)]
+use codex_sandboxing::sites_preview::SitesPreviewListener;
+#[cfg(unix)]
+use codex_sandboxing::sites_preview::SitesPreviewListenerError;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_path_uri::PathUri;
@@ -962,8 +968,6 @@ impl UnifiedExecProcessManager {
         mut spawn_lifecycle: SpawnLifecycleHandle,
         environment: &codex_exec_server::Environment,
     ) -> Result<UnifiedExecProcess, UnifiedExecError> {
-        let inherited_fds = spawn_lifecycle.inherited_fds();
-
         #[cfg(target_os = "windows")]
         if request.sandbox == codex_sandboxing::SandboxType::WindowsRestrictedToken {
             // TODO(anp): Keep PathUri through the Windows sandbox launch boundary.
@@ -1051,6 +1055,7 @@ impl UnifiedExecProcessManager {
             .await;
         }
         if environment.is_remote() {
+            let inherited_fds = spawn_lifecycle.inherited_fds();
             if !inherited_fds.is_empty() {
                 return Err(UnifiedExecError::create_process(
                     "remote exec-server does not support inherited file descriptors".to_string(),
@@ -1065,9 +1070,21 @@ impl UnifiedExecProcessManager {
             spawn_lifecycle.after_spawn();
             return UnifiedExecProcess::from_exec_server_started(started).await;
         }
+
+        let mut env = request.env.clone();
+        let mut inherited_fds = spawn_lifecycle.inherited_fds();
+        #[cfg(unix)]
+        let sites_preview =
+            SitesPreviewListener::prepare(request.sites_preview).map_err(sites_preview_error)?;
+        #[cfg(unix)]
+        if let Some(sites_preview) = sites_preview.as_ref() {
+            sites_preview.add_to_child_env(&mut env);
+            inherited_fds.push(sites_preview.inherited_fd());
+        }
+        #[cfg(not(unix))]
         if request.sites_preview {
             return Err(UnifiedExecError::create_process(
-                "Sites preview requires exec-server".to_string(),
+                "Sites preview is only supported on Unix hosts".to_string(),
             ));
         }
 
@@ -1088,7 +1105,7 @@ impl UnifiedExecProcessManager {
                 program,
                 args,
                 native_cwd.as_path(),
-                &request.env,
+                &env,
                 &request.arg0,
                 codex_utils_pty::TerminalSize::default(),
                 &inherited_fds,
@@ -1099,7 +1116,7 @@ impl UnifiedExecProcessManager {
                 program,
                 args,
                 native_cwd.as_path(),
-                &request.env,
+                &env,
                 &request.arg0,
                 &inherited_fds,
             )
@@ -1107,6 +1124,8 @@ impl UnifiedExecProcessManager {
         };
         let spawned =
             spawn_result.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
+        #[cfg(unix)]
+        drop(sites_preview);
         spawn_lifecycle.after_spawn();
         UnifiedExecProcess::from_spawned(spawned, request.sandbox, spawn_lifecycle).await
     }
@@ -1453,6 +1472,18 @@ impl UnifiedExecProcessManager {
 
         unregister_network_approval_for_entry(&entry).await;
         true
+    }
+}
+
+#[cfg(unix)]
+fn sites_preview_error(error: SitesPreviewListenerError) -> UnifiedExecError {
+    match error {
+        SitesPreviewListenerError::PortInUse => UnifiedExecError::create_process(format!(
+            "Sites preview port {SITES_PREVIEW_PORT} is already in use by another process"
+        )),
+        SitesPreviewListenerError::Io(error) => UnifiedExecError::create_process(format!(
+            "failed to prepare Sites preview listener: {error}"
+        )),
     }
 }
 

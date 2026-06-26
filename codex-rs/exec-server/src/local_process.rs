@@ -15,6 +15,12 @@ use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::shell_environment;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::is_likely_sandbox_denied;
+#[cfg(unix)]
+use codex_sandboxing::sites_preview::SITES_PREVIEW_PORT;
+#[cfg(unix)]
+use codex_sandboxing::sites_preview::SitesPreviewListener;
+#[cfg(unix)]
+use codex_sandboxing::sites_preview::SitesPreviewListenerError;
 use codex_utils_pty::ExecCommandSession;
 use codex_utils_pty::ProcessSignal as PtyProcessSignal;
 use codex_utils_pty::TerminalSize;
@@ -59,10 +65,6 @@ use crate::rpc::RpcServerOutboundMessage;
 use crate::rpc::internal_error;
 use crate::rpc::invalid_params;
 use crate::rpc::invalid_request;
-#[cfg(unix)]
-use crate::sites_preview::SitesPreviewListener;
-#[cfg(unix)]
-use crate::sites_preview::SitesPreviewListenerError;
 use crate::telemetry::ExecServerTelemetry;
 use crate::telemetry::ProcessMetricGuard;
 
@@ -618,9 +620,9 @@ fn child_env(params: &ExecParams) -> HashMap<String, String> {
 #[cfg(unix)]
 fn sites_preview_error(error: SitesPreviewListenerError) -> JSONRPCErrorError {
     match error {
-        SitesPreviewListenerError::PortInUse => invalid_request(
-            "Sites preview port 4173 is already in use by another process".to_string(),
-        ),
+        SitesPreviewListenerError::PortInUse => invalid_request(format!(
+            "Sites preview port {SITES_PREVIEW_PORT} is already in use by another process"
+        )),
         SitesPreviewListenerError::Io(error) => {
             internal_error(format!("failed to prepare Sites preview listener: {error}"))
         }
